@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8"/>
-  <title>Patch-Based RBM Denoising (Multi-Thread with Upload)</title>
+  <title>Patch-Based RBM: Train + Test Denoising</title>
   <style>
     body { font-family: sans-serif; }
     .canvas-container {
@@ -13,415 +13,480 @@
     }
     canvas {
       border: 1px solid black;
-      image-rendering: pixelated; /* helps show blocky data clearly */
+      image-rendering: pixelated; /* makes the blocky patches more visible */
     }
   </style>
 </head>
 <body>
 
-<h1>Patch-Based RBM Denoising</h1>
+<h1>Patch-Based RBM Denoising Demo</h1>
 <p>
-  This demo allows you to upload an image, splits it into 24×24 patches, spawns multiple Web Workers,
-  trains a small RBM per patch, then reconstructs (denoises) the noisy image patch by patch.
+  1) Upload a <strong>training image</strong> (clean) to learn RBMs (24×24 patches).  
+  2) Upload a <strong>noisy test image</strong> of the <em>exact same size</em> to denoise it.
 </p>
 
-<!-- 1) File input for uploading image -->
-<input type="file" id="fileInput" accept="image/*" />
+<!-- Buttons for training & testing -->
+<div>
+  <label>Training Image: <input type="file" id="trainFileInput" accept="image/*"></label>
+</div>
+<div style="margin-top:1em;">
+  <label>Noisy Test Image: <input type="file" id="testFileInput" accept="image/*"></label>
+</div>
 
-<!-- 2) Form to select number of threads -->
-<form id="threadForm" style="margin-top:1em;">
-  <label for="numThreads">Number of Web Worker Threads:</label>
-  <input type="number" id="numThreads" name="numThreads" value="4" min="1" max="16" />
-  <button type="submit">Start Denoising</button>
-</form>
-
+<!-- Canvases to show results -->
 <div class="canvas-container">
   <div>
-    <p>Original (cropped to multiples of 24×24)</p>
-    <canvas id="canvasOriginal"></canvas>
+    <p>Training Image (cropped to multiples of 24×24)</p>
+    <canvas id="canvasTrain"></canvas>
   </div>
   <div>
-    <p>Noisy</p>
-    <canvas id="canvasNoisy"></canvas>
+    <p>Noisy Test Image (same size)</p>
+    <canvas id="canvasTest"></canvas>
   </div>
   <div>
-    <p>Reconstructed</p>
+    <p>Denoised Output</p>
     <canvas id="canvasDenoised"></canvas>
   </div>
 </div>
 
-<!-- Hidden image element where we load the user file -->
-<img id="uploadedImage" alt="Uploaded image" style="display:none;" />
-
 <script>
-// ------------------------------------------------------------------
-// Global Variables / Configuration
-// ------------------------------------------------------------------
-const PATCH_SIZE = 24;           // We'll do 24×24 patches
-const CHANNELS = 3;             // R, G, B
-const NOISE_FRACTION = 0.2;     // 20% noise
+/*
+  Global Configuration & Data
+*/
+const PATCH_SIZE = 24;       // We'll do 24×24 patches
+const CHANNELS = 3;         // R,G,B
+const EPOCHS = 20;          // RBM epochs per patch (toy example)
+const HIDDEN_SIZE = 64;     // RBM hidden units (per patch)
+const LEARNING_RATE = 0.1;  // RBM learning rate
 
-// We'll set these once we know the image size
-let IMG_WIDTH = 0;
-let IMG_HEIGHT = 0;
+// Training image info
+let trainWidth = 0;
+let trainHeight = 0;
+let trainPatchRows = 0;
+let trainPatchCols = 0;
+let trainProcessedWidth = 0;
+let trainProcessedHeight = 0;
 
-// We'll only process the region that fits exactly into 24×24 blocks
-let PATCHES_PER_ROW = 0;
-let PATCHES_PER_COL = 0;
-let PROCESSED_WIDTH = 0;
-let PROCESSED_HEIGHT = 0;
-
-// We'll store the original patch data, the noisy patches, etc.
-let originalPatches = [];
-let noisyPatches = [];
-let reconstructedPatches = [];
+// We'll store the RBM parameters for each patch in an array.
+// patchModels[patchIndex] = { W, bVisible, bHidden }
+let patchModels = [];
 
 // Canvas contexts
-let ctxOriginal, ctxNoisy, ctxDenoised;
+let ctxTrain, ctxTest, ctxDenoised;
 
-// The user-selected image
-const uploadedImage = document.getElementById('uploadedImage');
+// Once the user loads the training image, we set up these canvases.
+const canvasT = document.getElementById('canvasTrain');
+const canvasTest = document.getElementById('canvasTest');
+const canvasD = document.getElementById('canvasDenoised');
 
-// ------------------------------------------------------------------
-// Utility: Add random noise by flipping bits
-// ------------------------------------------------------------------
-function addNoise(binaryArray, fraction) {
-  const noisy = binaryArray.slice();
-  const total = noisy.length;
-  const flips = Math.floor(total * fraction);
-  for (let i = 0; i < flips; i++) {
-    const idx = Math.floor(Math.random() * total);
-    noisy[idx] = 1 - noisy[idx];
-  }
-  return noisy;
-}
+ctxTrain = canvasT.getContext('2d');
+ctxTest = canvasTest.getContext('2d');
+ctxDenoised = canvasD.getContext('2d');
 
-// ------------------------------------------------------------------
-// Utility: Draw a single patch onto a canvas
-// ------------------------------------------------------------------
-function drawPatchToCanvas(binaryPatch, patchX, patchY, canvasCtx) {
-  const imageData = canvasCtx.createImageData(PATCH_SIZE, PATCH_SIZE);
-  const data = imageData.data; // RGBA
-
-  for (let i = 0; i < PATCH_SIZE * PATCH_SIZE; i++) {
-    const r = binaryPatch[i*3 + 0] * 255;
-    const g = binaryPatch[i*3 + 1] * 255;
-    const b = binaryPatch[i*3 + 2] * 255;
-
-    const offset = i * 4;
-    data[offset + 0] = r;
-    data[offset + 1] = g;
-    data[offset + 2] = b;
-    data[offset + 3] = 255;
-  }
-
-  canvasCtx.putImageData(imageData, patchX * PATCH_SIZE, patchY * PATCH_SIZE);
-}
-
-// ------------------------------------------------------------------
-// Utility: For partial update, draw one patch by index
-// ------------------------------------------------------------------
-function drawSinglePatch(patchArray, patchIndex, canvasCtx) {
-  const px = patchIndex % PATCHES_PER_ROW;
-  const py = Math.floor(patchIndex / PATCHES_PER_ROW);
-  drawPatchToCanvas(patchArray, px, py, canvasCtx);
-}
-
-// ------------------------------------------------------------------
-// Utility: Draw all patches to a canvas
-// ------------------------------------------------------------------
-function drawAllPatches(patches, canvasCtx) {
-  let patchIdx = 0;
-  for (let py = 0; py < PATCHES_PER_COL; py++) {
-    for (let px = 0; px < PATCHES_PER_ROW; px++) {
-      drawPatchToCanvas(patches[patchIdx], px, py, canvasCtx);
-      patchIdx++;
-    }
-  }
-}
-
-// ------------------------------------------------------------------
-// splitIntoPatches: turn a full RGBA array into binarized patch data
-// ------------------------------------------------------------------
-function splitIntoPatches(pixelData) {
-  originalPatches = [];
-
-  for (let py = 0; py < PATCHES_PER_COL; py++) {
-    for (let px = 0; px < PATCHES_PER_ROW; px++) {
-      // We'll store data in a typed array of length = PATCH_SIZE*PATCH_SIZE*3
-      const patchBinary = new Uint8Array(PATCH_SIZE * PATCH_SIZE * CHANNELS);
-
-      for (let iy = 0; iy < PATCH_SIZE; iy++) {
-        for (let ix = 0; ix < PATCH_SIZE; ix++) {
-          const gx = px*PATCH_SIZE + ix;
-          const gy = py*PATCH_SIZE + iy;
-
-          const index = (gy * IMG_WIDTH + gx) * 4;
-          const r = pixelData[index + 0];
-          const g = pixelData[index + 1];
-          const b = pixelData[index + 2];
-
-          // Binarize channel
-          const rBin = (r > 128) ? 1 : 0;
-          const gBin = (g > 128) ? 1 : 0;
-          const bBin = (b > 128) ? 1 : 0;
-
-          const patchOffset = (iy * PATCH_SIZE + ix) * 3;
-          patchBinary[patchOffset + 0] = rBin;
-          patchBinary[patchOffset + 1] = gBin;
-          patchBinary[patchOffset + 2] = bBin;
-        }
-      }
-      originalPatches.push(patchBinary);
-    }
-  }
-}
-
-// ------------------------------------------------------------------
-// onFileSelected: When user picks an image file from <input type="file">
-// ------------------------------------------------------------------
-document.getElementById('fileInput').addEventListener('change', async (e) => {
+/*
+  1) TRAINING IMAGE UPLOAD
+*/
+document.getElementById('trainFileInput').addEventListener('change', (e) => {
   const file = e.target.files[0];
   if (!file) return;
+
   const reader = new FileReader();
   reader.onload = (event) => {
-    uploadedImage.src = event.target.result;
+    const img = new Image();
+    img.onload = () => {
+      // Set the training image size
+      trainWidth = img.naturalWidth;
+      trainHeight = img.naturalHeight;
+
+      // Determine how many 24×24 patches fit
+      trainPatchRows = Math.floor(trainWidth / PATCH_SIZE);
+      trainPatchCols = Math.floor(trainHeight / PATCH_SIZE);
+
+      trainProcessedWidth = trainPatchRows * PATCH_SIZE;
+      trainProcessedHeight = trainPatchCols * PATCH_SIZE;
+
+      console.log(`Training image: ${trainWidth}×${trainHeight}`);
+      console.log(`Will train on region: ${trainProcessedWidth}×${trainProcessedHeight}`);
+
+      // Resize the canvas to match the processed area
+      canvasT.width = trainProcessedWidth;
+      canvasT.height = trainProcessedHeight;
+
+      // Draw the training image on a temp canvas
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = trainWidth;
+      tempCanvas.height = trainHeight;
+      const tempCtx = tempCanvas.getContext('2d');
+      tempCtx.drawImage(img, 0, 0);
+
+      // Extract the pixel data
+      const fullData = tempCtx.getImageData(0, 0, trainWidth, trainHeight).data;
+
+      // Crop to the region we can handle
+      // (We'll just ignore leftover pixels if trainWidth or trainHeight isn't multiple of 24)
+      const pixelData = extractRegion(fullData, trainWidth, trainHeight, 0, 0, trainProcessedWidth, trainProcessedHeight);
+
+      // Draw that portion onto the "training canvas"
+      const trainImageData = ctxTrain.createImageData(trainProcessedWidth, trainProcessedHeight);
+      trainImageData.data.set(pixelData);
+      ctxTrain.putImageData(trainImageData, 0, 0);
+
+      // Split into patches, train RBMs
+      trainRBMsFromImageData(pixelData, trainProcessedWidth, trainProcessedHeight);
+    };
+    img.src = event.target.result;
   };
   reader.readAsDataURL(file);
 });
 
-// ------------------------------------------------------------------
-// Once the uploadedImage is loaded, we can get its size and process
-// ------------------------------------------------------------------
-uploadedImage.onload = function() {
-  IMG_WIDTH = uploadedImage.naturalWidth;
-  IMG_HEIGHT = uploadedImage.naturalHeight;
+/*
+  2) TEST (NOISY) IMAGE UPLOAD
+*/
+document.getElementById('testFileInput').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
 
-  // Compute how many patches fit
-  PATCHES_PER_ROW = Math.floor(IMG_WIDTH / PATCH_SIZE);
-  PATCHES_PER_COL = Math.floor(IMG_HEIGHT / PATCH_SIZE);
-  PROCESSED_WIDTH = PATCHES_PER_ROW * PATCH_SIZE;
-  PROCESSED_HEIGHT = PATCHES_PER_COL * PATCH_SIZE;
-
-  console.log(`Uploaded image: ${IMG_WIDTH}×${IMG_HEIGHT}. Processing region: ${PROCESSED_WIDTH}×${PROCESSED_HEIGHT}`);
-
-  // Create temp canvas to extract pixel data
-  const tempCanvas = document.createElement('canvas');
-  tempCanvas.width = IMG_WIDTH;
-  tempCanvas.height = IMG_HEIGHT;
-  const tctx = tempCanvas.getContext('2d');
-  tctx.drawImage(uploadedImage, 0, 0);
-
-  // Extract pixel data (only top-left PROCESSED_WIDTH×PROCESSED_HEIGHT)
-  const fullImageData = tctx.getImageData(0, 0, IMG_WIDTH, IMG_HEIGHT);
-  const pixelData = fullImageData.data;
-
-  // Prepare main display canvases
-  const canvasO = document.getElementById('canvasOriginal');
-  const canvasN = document.getElementById('canvasNoisy');
-  const canvasD = document.getElementById('canvasDenoised');
-
-  canvasO.width = PROCESSED_WIDTH;
-  canvasO.height = PROCESSED_HEIGHT;
-  canvasN.width = PROCESSED_WIDTH;
-  canvasN.height = PROCESSED_HEIGHT;
-  canvasD.width = PROCESSED_WIDTH;
-  canvasD.height = PROCESSED_HEIGHT;
-
-  ctxOriginal = canvasO.getContext('2d');
-  ctxNoisy = canvasN.getContext('2d');
-  ctxDenoised = canvasD.getContext('2d');
-
-  // Split into patches
-  splitIntoPatches(pixelData);
-
-  // Draw initial "original" image
-  drawAllPatches(originalPatches, ctxOriginal);
-
-  console.log("Ready to start denoising with a chosen number of threads.");
-};
-
-// ------------------------------------------------------------------
-// handleFormSubmit: Called when user clicks "Start Denoising"
-// ------------------------------------------------------------------
-document.getElementById('threadForm').addEventListener('submit', (e) => {
-  e.preventDefault();
-  const numThreads = parseInt(document.getElementById('numThreads').value, 10) || 1;
-
-  if (!originalPatches || originalPatches.length === 0) {
-    alert("No image loaded or no patches found. Please upload a valid image first.");
+  // If no patchModels exist yet, we haven't trained anything.
+  if (patchModels.length === 0) {
+    alert("You haven't trained yet. Please upload a training image first!");
     return;
   }
 
-  console.log(`Starting patch-based denoising with ${numThreads} threads...`);
-
-  // Create noisy patches
-  noisyPatches = originalPatches.map(p => addNoise(p, NOISE_FRACTION));
-  // Draw them
-  drawAllPatches(noisyPatches, ctxNoisy);
-
-  // Prepare result array
-  reconstructedPatches = new Array(originalPatches.length);
-
-  // Dispatch patches to workers
-  const totalPatches = originalPatches.length;
-  const patchesPerWorker = Math.ceil(totalPatches / numThreads);
-  
-  let patchStartIndex = 0;
-  for (let w = 0; w < numThreads; w++) {
-    // Create worker from code string
-    const worker = new Worker(URL.createObjectURL(new Blob([WORKER_CODE], {type: 'text/javascript'})));
-
-    const endIndex = Math.min(patchStartIndex + patchesPerWorker, totalPatches);
-    const patchRange = { start: patchStartIndex, end: endIndex };
-
-    worker.onmessage = (msg) => {
-      if (msg.data.type === 'DONE') {
-        console.log(`Worker ${w} done. Patches [${patchRange.start}, ${patchRange.end}).`);
-        worker.terminate();
-      } else if (msg.data.type === 'PROGRESS') {
-        const { patchIndex, reconstructed } = msg.data;
-        reconstructedPatches[patchIndex] = reconstructed;
-        // Draw that patch
-        drawSinglePatch(reconstructed, patchIndex, ctxDenoised);
+  const reader = new FileReader();
+  reader.onload = (event) => {
+    const img = new Image();
+    img.onload = () => {
+      // The test image must be the same size as the training region
+      const tWidth = img.naturalWidth;
+      const tHeight = img.naturalHeight;
+      if (tWidth !== trainProcessedWidth || tHeight !== trainProcessedHeight) {
+        alert(`Test image is ${tWidth}×${tHeight}, but training region is ${trainProcessedWidth}×${trainProcessedHeight}. They must match!`);
+        return;
       }
+
+      console.log(`Test (noisy) image loaded: ${tWidth}×${tHeight}`);
+
+      // Resize test & denoised canvases
+      canvasTest.width = tWidth;
+      canvasTest.height = tHeight;
+      canvasD.width = tWidth;
+      canvasD.height = tHeight;
+
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = tWidth;
+      tempCanvas.height = tHeight;
+      const tempCtx = tempCanvas.getContext('2d');
+      tempCtx.drawImage(img, 0, 0);
+
+      // Extract pixel data for the entire image
+      const fullData = tempCtx.getImageData(0, 0, tWidth, tHeight).data;
+      // We'll just use it directly; it should match the training dimension
+      const testImageData = ctxTest.createImageData(tWidth, tHeight);
+      testImageData.data.set(fullData);
+      ctxTest.putImageData(testImageData, 0, 0);
+
+      // Now reconstruct (denoise) patch by patch
+      denoiseTestImage(fullData, tWidth, tHeight);
     };
-
-    const originalSlice = originalPatches.slice(patchStartIndex, endIndex);
-    const noisySlice = noisyPatches.slice(patchStartIndex, endIndex);
-
-    worker.postMessage({
-      type: 'INIT',
-      patchStart: patchStartIndex,
-      patchEnd: endIndex,
-      originalPatches: originalSlice,
-      noisyPatches: noisySlice
-    });
-
-    patchStartIndex = endIndex;
-    if (endIndex >= totalPatches) break;
-  }
+    img.src = event.target.result;
+  };
+  reader.readAsDataURL(file);
 });
 
-// ------------------------------------------------------------------
-// WORKER_CODE: minimal RBM approach for each patch
-// ------------------------------------------------------------------
-const WORKER_CODE = `
-  self.onmessage = (evt) => {
-    if (evt.data.type === 'INIT') {
-      const { patchStart, patchEnd, originalPatches, noisyPatches } = evt.data;
-
-      for (let localIdx = 0; localIdx < originalPatches.length; localIdx++) {
-        const globalPatchIndex = patchStart + localIdx;
-        const originalPatch = originalPatches[localIdx];
-        const noisyPatch = noisyPatches[localIdx];
-
-        // RBM config (toy example)
-        const visibleSize = originalPatch.length; // e.g. 24*24*3 = 1728
-        const hiddenSize = 64;
-        const learningRate = 0.1;
-        const epochs = 20; 
-
-        // Initialize
-        let W = [];
-        for (let i = 0; i < visibleSize; i++) {
-          W[i] = new Float32Array(hiddenSize);
-          for (let j = 0; j < hiddenSize; j++) {
-            W[i][j] = (Math.random()*0.1 - 0.05);
-          }
-        }
-        let bVisible = new Float32Array(visibleSize);
-        let bHidden = new Float32Array(hiddenSize);
-
-        function sigmoid(x) {
-          return 1 / (1 + Math.exp(-x));
-        }
-        function sampleBinary(p) {
-          return (Math.random() < p) ? 1 : 0;
-        }
-        function computeHiddenProb(v) {
-          let hp = new Float32Array(hiddenSize);
-          for (let j = 0; j < hiddenSize; j++) {
-            let act = bHidden[j];
-            for (let i = 0; i < visibleSize; i++) {
-              act += v[i] * W[i][j];
-            }
-            hp[j] = sigmoid(act);
-          }
-          return hp;
-        }
-        function computeVisibleProb(h) {
-          let vp = new Float32Array(visibleSize);
-          for (let i = 0; i < visibleSize; i++) {
-            let act = bVisible[i];
-            for (let j = 0; j < hiddenSize; j++) {
-              act += h[j] * W[i][j];
-            }
-            vp[i] = sigmoid(act);
-          }
-          return vp;
-        }
-        function trainRBM(sample) {
-          // Positive phase
-          const hProbData = computeHiddenProb(sample);
-          let hSampleData = new Uint8Array(hiddenSize);
-          for (let j=0; j<hiddenSize; j++) {
-            hSampleData[j] = sampleBinary(hProbData[j]);
-          }
-
-          // Negative phase
-          const vProbRec = computeVisibleProb(hSampleData);
-          let vSampleRec = new Uint8Array(visibleSize);
-          for (let i=0; i<visibleSize; i++) {
-            vSampleRec[i] = sampleBinary(vProbRec[i]);
-          }
-          const hProbRec = computeHiddenProb(vSampleRec);
-
-          // Weight update
-          for (let i=0; i<visibleSize; i++) {
-            for (let j=0; j<hiddenSize; j++) {
-              const pos = sample[i] * hProbData[j];
-              const neg = vSampleRec[i] * hProbRec[j];
-              W[i][j] += learningRate * (pos - neg);
-            }
-          }
-          // Bias update
-          for (let i=0; i<visibleSize; i++) {
-            bVisible[i] += learningRate * (sample[i] - vSampleRec[i]);
-          }
-          for (let j=0; j<hiddenSize; j++) {
-            bHidden[j] += learningRate * (hProbData[j] - hProbRec[j]);
-          }
-        }
-
-        // 1) Train on the clean/original patch for some epochs
-        for (let e=0; e<epochs; e++) {
-          trainRBM(originalPatch);
-        }
-
-        // 2) Reconstruct the noisy patch
-        const hProbNoisy = computeHiddenProb(noisyPatch);
-        let hSampleNoisy = new Uint8Array(hiddenSize);
-        for (let j=0; j<hiddenSize; j++) {
-          hSampleNoisy[j] = sampleBinary(hProbNoisy[j]);
-        }
-        const vProbDenoised = computeVisibleProb(hSampleNoisy);
-        let vDenoised = new Uint8Array(visibleSize);
-        for (let i=0; i<visibleSize; i++) {
-          vDenoised[i] = (vProbDenoised[i] > 0.5) ? 1 : 0;
-        }
-
-        // Send partial result
-        self.postMessage({
-          type: 'PROGRESS',
-          patchIndex: globalPatchIndex,
-          reconstructed: vDenoised
-        });
-      }
-      self.postMessage({ type: 'DONE' });
+/*
+  extractRegion:
+  - Given RGBA data, extract the subregion [x, x+width) × [y, y+height)
+  - Return the RGBA array for that region
+*/
+function extractRegion(rgbaData, fullW, fullH, startX, startY, cropW, cropH) {
+  const output = new Uint8ClampedArray(cropW * cropH * 4);
+  for (let row = 0; row < cropH; row++) {
+    for (let col = 0; col < cropW; col++) {
+      const sx = startX + col;
+      const sy = startY + row;
+      const srcIndex = (sy * fullW + sx) * 4;
+      const dstIndex = (row * cropW + col) * 4;
+      output[dstIndex + 0] = rgbaData[srcIndex + 0];
+      output[dstIndex + 1] = rgbaData[srcIndex + 1];
+      output[dstIndex + 2] = rgbaData[srcIndex + 2];
+      output[dstIndex + 3] = rgbaData[srcIndex + 3];
     }
-  };
-`;
+  }
+  return output;
+}
+
+/*
+  trainRBMsFromImageData:
+  - Takes the RGBA pixelData for the region
+  - Splits into 24×24 patches (for each patch, we binarize + train an RBM)
+  - Stores the resulting models in `patchModels`
+*/
+function trainRBMsFromImageData(pixelData, width, height) {
+  patchModels = []; // clear old data
+
+  console.log(`Splitting into patches of size ${PATCH_SIZE}×${PATCH_SIZE}...`);
+  // compute how many patches
+  const rows = Math.floor(height / PATCH_SIZE);
+  const cols = Math.floor(width / PATCH_SIZE);
+  const totalPatches = rows * cols;
+  console.log(`Total patches: ${totalPatches}`);
+
+  // For each patch:
+  let patchIndex = 0;
+  for (let py = 0; py < rows; py++) {
+    for (let px = 0; px < cols; px++) {
+      // Extract the patch's RGBA data
+      const patchRGBA = new Uint8Array(PATCH_SIZE * PATCH_SIZE * 4);
+      for (let iy = 0; iy < PATCH_SIZE; iy++) {
+        for (let ix = 0; ix < PATCH_SIZE; ix++) {
+          const gx = px * PATCH_SIZE + ix;
+          const gy = py * PATCH_SIZE + iy;
+          const srcIndex = (gy * width + gx) * 4;
+          const dstIndex = (iy * PATCH_SIZE + ix) * 4;
+          patchRGBA[dstIndex + 0] = pixelData[srcIndex + 0];
+          patchRGBA[dstIndex + 1] = pixelData[srcIndex + 1];
+          patchRGBA[dstIndex + 2] = pixelData[srcIndex + 2];
+          patchRGBA[dstIndex + 3] = pixelData[srcIndex + 3];
+        }
+      }
+
+      // Convert RGBA to binary [0 or 1 for R, G, B]
+      const binaryPatch = rgbaToBinary(patchRGBA, PATCH_SIZE, PATCH_SIZE);
+
+      // Train an RBM on this single patch
+      const model = trainRBM(binaryPatch); 
+      patchModels.push(model);
+
+      patchIndex++;
+      if (patchIndex % 100 === 0) {
+        console.log(`Trained patch ${patchIndex} / ${totalPatches}`);
+      }
+    }
+  }
+  console.log("Training complete for all patches!");
+}
+
+/*
+  denoiseTestImage:
+  - Split test image into patches
+  - For each patch, binarize, run the stored RBM for that patch to reconstruct
+  - Combine all reconstructed patches into the final canvas
+*/
+function denoiseTestImage(pixelData, width, height) {
+  const rows = Math.floor(height / PATCH_SIZE);
+  const cols = Math.floor(width / PATCH_SIZE);
+
+  let patchIndex = 0;
+  const outputCanvasData = ctxDenoised.createImageData(width, height);
+
+  for (let py = 0; py < rows; py++) {
+    for (let px = 0; px < cols; px++) {
+      // Extract patch RGBA
+      const patchRGBA = new Uint8Array(PATCH_SIZE * PATCH_SIZE * 4);
+      for (let iy = 0; iy < PATCH_SIZE; iy++) {
+        for (let ix = 0; ix < PATCH_SIZE; ix++) {
+          const gx = px * PATCH_SIZE + ix;
+          const gy = py * PATCH_SIZE + iy;
+          const srcIndex = (gy * width + gx) * 4;
+          const dstIndex = (iy * PATCH_SIZE + ix) * 4;
+          patchRGBA[dstIndex + 0] = pixelData[srcIndex + 0];
+          patchRGBA[dstIndex + 1] = pixelData[srcIndex + 1];
+          patchRGBA[dstIndex + 2] = pixelData[srcIndex + 2];
+          patchRGBA[dstIndex + 3] = pixelData[srcIndex + 3];
+        }
+      }
+
+      // Convert to binary
+      const noisyBinaryPatch = rgbaToBinary(patchRGBA, PATCH_SIZE, PATCH_SIZE);
+
+      // Reconstruct using the patch's learned model
+      const model = patchModels[patchIndex];
+      const reconstructed = reconstructPatch(noisyBinaryPatch, model);
+
+      // Convert back to RGBA
+      const reconstructedRGBA = binaryToRGBA(reconstructed, PATCH_SIZE, PATCH_SIZE);
+
+      // Write into outputCanvasData
+      for (let iy = 0; iy < PATCH_SIZE; iy++) {
+        for (let ix = 0; ix < PATCH_SIZE; ix++) {
+          const gx = px * PATCH_SIZE + ix;
+          const gy = py * PATCH_SIZE + iy;
+          const dstIndex = (gy * width + gx) * 4;
+          const srcIndex = (iy * PATCH_SIZE + ix) * 4;
+          outputCanvasData.data[dstIndex + 0] = reconstructedRGBA[srcIndex + 0];
+          outputCanvasData.data[dstIndex + 1] = reconstructedRGBA[srcIndex + 1];
+          outputCanvasData.data[dstIndex + 2] = reconstructedRGBA[srcIndex + 2];
+          outputCanvasData.data[dstIndex + 3] = reconstructedRGBA[srcIndex + 3];
+        }
+      }
+
+      patchIndex++;
+    }
+  }
+
+  // Put the reconstructed data onto the canvas
+  ctxDenoised.putImageData(outputCanvasData, 0, 0);
+  console.log("Denoising complete!");
+}
+
+/*
+  RGBA -> [0 or 1 for R, G, B]
+*/
+function rgbaToBinary(rgbaArray, w, h) {
+  const output = new Uint8Array(w * h * CHANNELS);
+  // threshold each channel at 128
+  for (let i = 0; i < w*h; i++) {
+    const r = rgbaArray[i*4 + 0];
+    const g = rgbaArray[i*4 + 1];
+    const b = rgbaArray[i*4 + 2];
+    output[i*3 + 0] = (r > 128) ? 1 : 0;
+    output[i*3 + 1] = (g > 128) ? 1 : 0;
+    output[i*3 + 2] = (b > 128) ? 1 : 0;
+  }
+  return output;
+}
+
+/*
+  Binary [R,G,B] -> RGBA
+*/
+function binaryToRGBA(binArray, w, h) {
+  const output = new Uint8ClampedArray(w * h * 4);
+  for (let i = 0; i < w*h; i++) {
+    const r = binArray[i*3 + 0] * 255;
+    const g = binArray[i*3 + 1] * 255;
+    const b = binArray[i*3 + 2] * 255;
+    output[i*4 + 0] = r;
+    output[i*4 + 1] = g;
+    output[i*4 + 2] = b;
+    output[i*4 + 3] = 255;
+  }
+  return output;
+}
+
+/*
+  trainRBM:
+  - Trains a small RBM on a single patch (which is one data point in this toy demo).
+  - Returns {W, bVisible, bHidden}.
+*/
+function trainRBM(patchBinary) {
+  const visibleSize = patchBinary.length; // e.g. 24*24*3 = 1728
+  // Initialize parameters
+  let W = [];
+  for (let i = 0; i < visibleSize; i++) {
+    W[i] = new Float32Array(HIDDEN_SIZE);
+    for (let j = 0; j < HIDDEN_SIZE; j++) {
+      W[i][j] = (Math.random() * 0.1 - 0.05);
+    }
+  }
+  let bVisible = new Float32Array(visibleSize);
+  let bHidden = new Float32Array(HIDDEN_SIZE);
+
+  // training for EPOCHS
+  for (let e = 0; e < EPOCHS; e++) {
+    contrastiveDivergence(patchBinary, W, bVisible, bHidden);
+  }
+
+  return { W, bVisible, bHidden };
+}
+
+/*
+  contrastiveDivergence:
+  - One step of CD-1 on a single sample "vData".
+*/
+function contrastiveDivergence(vData, W, bVisible, bHidden) {
+  const visibleSize = vData.length;
+  // Positive phase
+  const hProbData = computeHiddenProb(vData, W, bHidden);
+  const hSampleData = new Uint8Array(HIDDEN_SIZE);
+  for (let j = 0; j < HIDDEN_SIZE; j++) {
+    hSampleData[j] = sampleBinary(hProbData[j]);
+  }
+
+  // Negative phase
+  const vProbRec = computeVisibleProb(hSampleData, W, bVisible);
+  const vSampleRec = new Uint8Array(visibleSize);
+  for (let i = 0; i < visibleSize; i++) {
+    vSampleRec[i] = sampleBinary(vProbRec[i]);
+  }
+  const hProbRec = computeHiddenProb(vSampleRec, W, bHidden);
+
+  // Update weights
+  for (let i = 0; i < visibleSize; i++) {
+    for (let j = 0; j < HIDDEN_SIZE; j++) {
+      const pos = vData[i] * hProbData[j];
+      const neg = vSampleRec[i] * hProbRec[j];
+      W[i][j] += LEARNING_RATE * (pos - neg);
+    }
+  }
+  // Update biases
+  for (let i = 0; i < visibleSize; i++) {
+    bVisible[i] += LEARNING_RATE * (vData[i] - vSampleRec[i]);
+  }
+  for (let j = 0; j < HIDDEN_SIZE; j++) {
+    bHidden[j] += LEARNING_RATE * (hProbData[j] - hProbRec[j]);
+  }
+}
+
+/*
+  reconstructPatch:
+  - Given a "noisy" patch and an already-trained model {W, bVisible, bHidden},
+    produce the reconstructed (denoised) patch.
+*/
+function reconstructPatch(noisyPatch, model) {
+  const { W, bVisible, bHidden } = model;
+  const visibleSize = noisyPatch.length;
+
+  // compute hidden from the noisy patch
+  const hProb = computeHiddenProb(noisyPatch, W, bHidden);
+  const hSample = new Uint8Array(HIDDEN_SIZE);
+  for (let j = 0; j < HIDDEN_SIZE; j++) {
+    hSample[j] = sampleBinary(hProb[j]);
+  }
+
+  // reconstruct
+  const vProb = computeVisibleProb(hSample, W, bVisible);
+  const vRec = new Uint8Array(visibleSize);
+  for (let i = 0; i < visibleSize; i++) {
+    vRec[i] = (vProb[i] > 0.5) ? 1 : 0;
+  }
+  return vRec;
+}
+
+/*
+  RBM Utility Functions
+*/
+function computeHiddenProb(v, W, bHidden) {
+  const hiddenProb = new Float32Array(HIDDEN_SIZE);
+  for (let j = 0; j < HIDDEN_SIZE; j++) {
+    let sum = bHidden[j];
+    for (let i = 0; i < v.length; i++) {
+      sum += v[i] * W[i][j];
+    }
+    hiddenProb[j] = sigmoid(sum);
+  }
+  return hiddenProb;
+}
+
+function computeVisibleProb(h, W, bVisible) {
+  const visibleProb = new Float32Array(bVisible.length);
+  for (let i = 0; i < visibleProb.length; i++) {
+    let sum = bVisible[i];
+    for (let j = 0; j < HIDDEN_SIZE; j++) {
+      sum += h[j] * W[i][j];
+    }
+    visibleProb[i] = sigmoid(sum);
+  }
+  return visibleProb;
+}
+
+function sigmoid(x) {
+  return 1 / (1 + Math.exp(-x));
+}
+
+function sampleBinary(prob) {
+  return (Math.random() < prob) ? 1 : 0;
+}
+
 </script>
 
 </body>
